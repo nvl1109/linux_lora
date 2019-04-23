@@ -11,7 +11,8 @@
 #include "supervisor.h"
 #include "os_abstraction.h"
 
-#define MAX_SLAVE 5
+#define MAX_SLAVE 30
+
 typedef enum {
     SLAVE_OFFLINE = 0,
     SLAVE_ONLINE,
@@ -24,6 +25,8 @@ struct slave {
     int addr;
     int64_t last_status_time_ms;
     int is_online;
+    struct messageFormat order;
+    bool ack_recieved;
     slave_state_t state;
 };
 
@@ -169,7 +172,6 @@ static void *s_lora_thread_func(void *arg)
             count = 0;
             while (loraAvailable()) {
                 msgPtr[count] = loraRead();
-                //you can clear FIFO in case packet does not belong to your node
                 if(count == 3)
                 {
                     if (msgPtr[1] != MASTER_DEVICE_ID && msgPtr[2] != sign.sign_high && msgPtr[3] != sign.sign_low) {
@@ -183,47 +185,63 @@ static void *s_lora_thread_func(void *arg)
                 }
                 count++;
             }
-            if (not_interested) continue;
             print_dbg("Packet received: %d/%d bytes", count, sizeof(msg));
-            if(last_requestID != msg.requestID) {
+            if(last_requestID != msg.requestID && !not_interested) {
                 last_requestID = msg.requestID;
-
-                // TODO: process
                 print_dbg("RECV id %x, src %x, dst %x, sign %x, pkt id %x, type %d, len %d",
                     msg.requestID, msg.srcAddress, msg.destAddress, msg.signature, msg.packetID, msg.packetTyp, msg.length);
-                if (msg.packetTyp == RESP_STATUS_PACKET) {
-                    // Status packet --> update slave status
-                    if (!s_slaves[msg.srcAddress].is_online) {
-                        s_slaves[msg.srcAddress].is_online = 1;
-                        s_slaves[msg.srcAddress].state = SLAVE_ONLINE;
-                        print_inf("Slave #%d is ONLINE", msg.srcAddress);
-                    }
-                    clock_gettime(CLOCK_REALTIME, &ts);
-                    s_slaves[msg.srcAddress].last_status_time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
-                } else if (msg.packetTyp == RESP_ACKNOWLEDGE_PACKET) {
-                    print_inf("ACK packet recved, slave #%d", msg.srcAddress);
-                } else if ((msg.packetTyp > RESP_ACKNOWLEDGE_PACKET) && (msg.packetTyp < RESP_INVALID_PACKET)) {
+                if ((msg.packetTyp >= RESP_DEVICE_STARTED) && (msg.packetTyp <= RESP_INVALID_FRAME_NUMBER_ID)) {
                     print_inf("RESP packet received, slave #%d", msg.srcAddress);
+                    switch (msg.packetTyp) {
+                        case RESP_STATUS_PACKET:
+                            // Status packet --> update slave status
+                            if (!s_slaves[msg.srcAddress].is_online) {
+                                s_slaves[msg.srcAddress].is_online = 1;
+                                s_slaves[msg.srcAddress].state = SLAVE_ONLINE;
+                                print_inf("Slave #%d is ONLINE", msg.srcAddress);
+                            }
+                            clock_gettime(CLOCK_REALTIME, &ts);
+                            s_slaves[msg.srcAddress].last_status_time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
+                        case RESP_ACKNOWLEDGE_PACKET:
+                        case RESP_ACKNOWLEDGE_INTERIM_PACKET:
+                            //NICK recieved ack for our order packet no need to resend last order
+                            if(s_slaves[msg.srcAddress].order.requestID == msg.requestID){
+                                 s_slaves[msg.srcAddress].ack_recieved == true;
+                            }
+
+                        break;
+                        case RESP_DEVICE_STARTED:
+                        case RESP_INVALID_PACKET:
+                        case RESP_INVALID_INTERIM_REQUEST_ID:
+                        case RESP_INVALID_FRAME_NUMBER_ID:
+                        //NICK resend the last order again as slave thinks last order was incorrect or slave was rebooted.
+                            check_slave_status();
+                        break;
+
+                        case RESP_READ_ANALOG_SENSOR:
+                        case RESP_READ_DIGITAL_SENSOR:
+                        case RESP_WRITE_GPIO_OUTPUT_PINS:
+                        case RESP_READ_GPIO_INPUT_PINS:
+                        case RESP_READ_I2C_DATA:
+                        case RESP_READ_UART1_DATA:
+                        case RESP_READ_UART2_DATA:
+                        //NICK recieved response to order packet
+                        break;
+
+                        default:
+                            printf("Invalid choice %c. Try again.\n", choice);
+                            //NICK if you had sent an order last time to the slave and waiting for ACK
+                            //resend the order as we did not recieve any ACK
+                    }
                 } else {
                     print_err("Received invalid packet %d, slave #%d", msg.packetTyp, msg.srcAddress);
                 }
            } else {
-                //resend ack as the mesg is recieved again
-                // sendResp(msg.requestID, msg.packetID, RESP_ACKNOWLEDGE_PACKET);
+                //NICK fix slave device because it is sending last packet again and again
            }
-           
+             check_slave_status();
         } else {
-            os_delay_ms(5);
-            clock_gettime(CLOCK_REALTIME, &ts);
-            time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
-            for (i = 0; i < MAX_SLAVE; ++i) {
-                if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 10000)) {
-                    // don't receive status message in 10s --> set offline
-                    s_slaves[i].is_online = 0;
-                    s_slaves[i].state = SLAVE_OFFLINE;
-                    print_inf("Slave #%d is OFFLINE", i);
-                }
-            }
+             check_slave_status();
         }
     }
 
@@ -236,4 +254,25 @@ static void int_handler(int dummy)
 {
     signal(dummy, SIG_IGN);
     s_thread_stop = 1;
+}
+
+void check_slave_status()
+{
+  os_delay_ms(5);
+  clock_gettime(CLOCK_REALTIME, &ts);
+  time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
+  for (i = 0; i < MAX_SLAVE; ++i) {
+      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 10000)) {
+          // don't receive status message in 10s --> set offline
+          s_slaves[i].is_online = 0;
+          s_slaves[i].state = SLAVE_OFFLINE;
+          print_inf("Slave #%d is OFFLINE", i);
+      }
+  }
+  //resend order since we did not recieve any ACK
+  for (i = 0; i < MAX_SLAVE; ++i) {
+      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 1000) && s_slaves[i].order.requestID > 0 && s_slaves[i].ack_recieved == false) {
+          //resend last order as we did not recieve ACK
+      }
+  }
 }

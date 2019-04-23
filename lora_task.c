@@ -1,6 +1,6 @@
 #include "debug.h"
 #include "os_abstraction.h"
-#include "lora.h"
+#include "lora_rfm95.h"
 #include "lora_task.h"
 
 int lora_task_init(void)

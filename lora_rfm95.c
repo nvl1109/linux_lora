@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "lora.h"
+#include "lora_rfm95.h"
 #include "debug.h"
 #include "lora_gpio.h"
 #include "lora_spi.h"
