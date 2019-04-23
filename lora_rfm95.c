@@ -545,7 +545,7 @@ void setOCP(uint8_t mA)
     writeRegister(REG_OCP, 0x20 | (0x1F & ocpTrim));
 }
 
-uint8_t random()
+uint8_t readRssi()
 {
     return readRegister(REG_RSSI_WIDEBAND);
 }

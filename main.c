@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
@@ -7,11 +8,12 @@
 #include <signal.h>
 
 #include "debug.h"
-#include "lora.h"
+#include "lora_rfm95.h"
 #include "supervisor.h"
 #include "os_abstraction.h"
 
 #define MAX_SLAVE 30
+//struct messageFormat txData;
 
 typedef enum {
     SLAVE_OFFLINE = 0,
@@ -26,6 +28,7 @@ struct slave {
     int64_t last_status_time_ms;
     int is_online;
     struct messageFormat order;
+    int64_t last_order_time_ms;
     bool ack_recieved;
     slave_state_t state;
 };
@@ -37,8 +40,7 @@ union splitData {
 };
 
 union splitSignature {
-   uint8_t  sign_high;
-   uint8_t  sign_low;
+   uint8_t  signbyte[2];
    uint16_t signature;
 };
 
@@ -53,8 +55,13 @@ static struct slave s_slaves[MAX_SLAVE] = {
 
 static pthread_t s_lora_thread;
 static int s_thread_stop = 0;
+struct timespec ts;
 static void *s_lora_thread_func(void *arg);
 static void int_handler(int dummy);
+void check_slave_status();
+void sendNewOrder(uint8_t deviceID);
+void resendOldOrder(struct messageFormat *txData, uint8_t deviceID);
+void clearOrder(uint8_t deviceID);
 
 static uint16_t last_requestID = 0;
 int  idx = 0;
@@ -69,6 +76,9 @@ int main(int argc, char **argv)
     int i;
 
     s_thread_stop = 0;
+    for(i = 0; i < MAX_SLAVE; ++i){
+      clearOrder(i);
+    }
     ret = pthread_create(&s_lora_thread, NULL, s_lora_thread_func, NULL);
     if (0 != ret) {
         print_err("Create lora thread failed");
@@ -104,6 +114,7 @@ int main(int argc, char **argv)
             case '3':
             case '4':
             case '5':
+             sendNewOrder(choice);
             break;
 
             case 'q':
@@ -129,15 +140,15 @@ static void *s_lora_thread_func(void *arg)
     struct messageFormat msg;
     union splitSignature sign;
     char *msgPtr = (char *) &msg;
+    char data;
     int not_interested = 0;
-    struct timespec ts;
     int64_t time_ms;
     int i;
 
     count = loraInit();
     if (0 != count) {
         print_err("lora init failed");
-        return -1;
+        return NULL;
     }
     print_inf("loraInit done");
 
@@ -162,7 +173,6 @@ static void *s_lora_thread_func(void *arg)
     sign.signature = SSLA_SIGNATURE;
 
     while(!s_thread_stop) {
-
         // Receive packet
         count = parsePacket(0);
         if (count) {
@@ -171,11 +181,14 @@ static void *s_lora_thread_func(void *arg)
             print_dbg("Has message %dbytes with RSSI %d", count, packetRssi());
             count = 0;
             while (loraAvailable()) {
-                msgPtr[count] = loraRead();
+                data = loraRead();
+                if(count < LORA_TX_BUFF_SIZE){
+                    msgPtr[count] = data;
+                }
                 if(count == 3)
                 {
-                    if (msgPtr[1] != MASTER_DEVICE_ID && msgPtr[2] != sign.sign_high && msgPtr[3] != sign.sign_low) {
-                        print_inf("Ignore message. id %x, sign %x %x", msgPtr[1], msgPtr[2], msgPtr[3]);
+                    if ( msgPtr[0] > MAX_SLAVE || msgPtr[1] != MASTER_DEVICE_ID || msgPtr[2] != sign.signbyte[0] || msgPtr[3] != sign.signbyte[1]) {
+                        print_inf("Ignore message. id 0x%x 0x%x, sign 0x%x 0x%x sign_low = 0x%x sign_high = 0x%x",msgPtr[0], msgPtr[1], msgPtr[2], msgPtr[3],sign.signbyte[0],sign.signbyte[1] );
                         loraSleep(); // Enter sleep mode to clear FIFO
                         os_delay_ms(2);
                         loraIdle();  // Back to standby mode
@@ -185,7 +198,7 @@ static void *s_lora_thread_func(void *arg)
                 }
                 count++;
             }
-            print_dbg("Packet received: %d/%d bytes", count, sizeof(msg));
+            print_dbg("Packet received: %d/%d bytes and request id 0x%x", count, sizeof(msg) , msg.requestID);
             if(last_requestID != msg.requestID && !not_interested) {
                 last_requestID = msg.requestID;
                 print_dbg("RECV id %x, src %x, dst %x, sign %x, pkt id %x, type %d, len %d",
@@ -201,20 +214,18 @@ static void *s_lora_thread_func(void *arg)
                                 print_inf("Slave #%d is ONLINE", msg.srcAddress);
                             }
                             clock_gettime(CLOCK_REALTIME, &ts);
-                            s_slaves[msg.srcAddress].last_status_time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
+                            s_slaves[msg.srcAddress].last_status_time_ms = (ts.tv_sec * 1000 + ts.tv_nsec / 10000000);
                         case RESP_ACKNOWLEDGE_PACKET:
                         case RESP_ACKNOWLEDGE_INTERIM_PACKET:
-                            //NICK recieved ack for our order packet no need to resend last order
                             if(s_slaves[msg.srcAddress].order.requestID == msg.requestID){
                                  s_slaves[msg.srcAddress].ack_recieved == true;
                             }
-
+                            clearOrder(msg.srcAddress);
                         break;
                         case RESP_DEVICE_STARTED:
                         case RESP_INVALID_PACKET:
                         case RESP_INVALID_INTERIM_REQUEST_ID:
                         case RESP_INVALID_FRAME_NUMBER_ID:
-                        //NICK resend the last order again as slave thinks last order was incorrect or slave was rebooted.
                             check_slave_status();
                         break;
 
@@ -229,20 +240,16 @@ static void *s_lora_thread_func(void *arg)
                         break;
 
                         default:
-                            printf("Invalid choice %c. Try again.\n", choice);
-                            //NICK if you had sent an order last time to the slave and waiting for ACK
-                            //resend the order as we did not recieve any ACK
+                            printf("Invalid packetTyp.\n");
                     }
                 } else {
-                    print_err("Received invalid packet %d, slave #%d", msg.packetTyp, msg.srcAddress);
+                    print_err("Received invalid packet %d, from slave #%d", msg.packetTyp, msg.srcAddress);
                 }
            } else {
-                //NICK fix slave device because it is sending last packet again and again
+                print_inf("message is same from 0x%x", msg.srcAddress);
            }
-             check_slave_status();
-        } else {
-             check_slave_status();
         }
+        check_slave_status();
     }
 
 lb_lora_exit:
@@ -258,11 +265,13 @@ static void int_handler(int dummy)
 
 void check_slave_status()
 {
+  int64_t time_ms;
+  int i;
   os_delay_ms(5);
   clock_gettime(CLOCK_REALTIME, &ts);
   time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
-  for (i = 0; i < MAX_SLAVE; ++i) {
-      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 10000)) {
+  for (i = 0; i < MAX_SLAVE; i++) {
+      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 5000)) {
           // don't receive status message in 10s --> set offline
           s_slaves[i].is_online = 0;
           s_slaves[i].state = SLAVE_OFFLINE;
@@ -270,9 +279,45 @@ void check_slave_status()
       }
   }
   //resend order since we did not recieve any ACK
-  for (i = 0; i < MAX_SLAVE; ++i) {
-      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 1000) && s_slaves[i].order.requestID > 0 && s_slaves[i].ack_recieved == false) {
-          //resend last order as we did not recieve ACK
+  for (i = 0; i < MAX_SLAVE; i++) {
+      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_order_time_ms) >= 3000) && s_slaves[i].order.requestID > 0 && s_slaves[i].ack_recieved == false) {
+         resendOldOrder(&s_slaves[i].order ,i);
       }
   }
+}
+
+void sendNewOrder(uint8_t deviceID)
+{
+  uint16_t reqID = 0;
+  if(s_slaves[deviceID].order.requestID > 0) {
+    return;
+  }
+  reqID = (rand() % 10000);
+  s_slaves[deviceID].order.srcAddress  = (uint8_t) MASTER_DEVICE_ID;
+  s_slaves[deviceID].order.destAddress = deviceID;
+  s_slaves[deviceID].order.signature   = SSLA_SIGNATURE;
+  s_slaves[deviceID].order.requestID   = reqID;
+  s_slaves[deviceID].order.packetID    = 0x0101;
+  s_slaves[deviceID].order.packetTyp   = REQ_READ_ANALOG_SENSOR;
+  s_slaves[deviceID].order.length      = 0;
+  beginPacket(0);
+  loraWriteBuf((uint8_t *)&s_slaves[deviceID].order, LORA_HEADER_SIZE + s_slaves[deviceID].order.length);
+  endPacket(0);
+  os_delay_ms(2);
+  clock_gettime(CLOCK_REALTIME, &ts);
+  s_slaves[deviceID].last_order_time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
+}
+
+void resendOldOrder(struct messageFormat *txData, uint8_t deviceID)
+{
+  beginPacket(0);
+  loraWriteBuf((uint8_t *)&txData, LORA_HEADER_SIZE + txData->length);
+  endPacket(0);
+  os_delay_ms(2);
+  clock_gettime(CLOCK_REALTIME, &ts);
+  s_slaves[deviceID].last_order_time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
+}
+
+void clearOrder(uint8_t deviceID) {
+    memset(&s_slaves[deviceID], 0, sizeof(struct slave));
 }

@@ -1,5 +1,5 @@
-#ifndef ___LORA_H___
-#define ___LORA_H___ 1
+#ifndef ___LORA_RFM95_H___
+#define ___LORA_RFM95_H___ 1
 
 // Copyright (c) Sandeep Mistry. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
@@ -9,7 +9,7 @@
 #define LORA_FREQUENCY_US                          915000
 #define LORA_FREQUENCY_AS                          433000
 
-#define LORA_FREQUENCY LORA_FREQUENCY_US
+#define LORA_FREQUENCY LORA_FREQUENCY_EU
 
 #define PA_OUTPUT_RFO_PIN          0
 #define PA_OUTPUT_PA_BOOST_PIN     1
@@ -57,7 +57,7 @@ void setOCP(uint8_t mA); // Over Current Protection control
 void crc();
 void noCrc();
 
-uint8_t random();
+uint8_t readRssi();
 
 void setSPIFrequency(uint32_t frequency);
 
