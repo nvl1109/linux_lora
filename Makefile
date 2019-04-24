@@ -2,8 +2,9 @@ APP_NAME=lora-linux
 SRC_FILES := $(shell find . -name '*.c')
 OBJ_FILES = $(SRC_FILES:.c=.o)
 HEADER_FILES := $(shell find . -name '*.h')
+SPI_DEV ?= /dev/spidev1.0
 
-CFLAGS += -Wall -D__DEBUG=1
+CFLAGS += -Wall -D__DEBUG=0 -DSPI_DEV=\"$(SPI_DEV)\"
 LDFLAGS += -lpthread
 
 all: $(APP_NAME)
@@ -11,6 +12,7 @@ all: $(APP_NAME)
 $(APP_NAME): $(OBJ_FILES)
 	@echo "LD $(APP_NAME)"
 	@$(CC) -o $(APP_NAME) $^ $(LDFLAGS)
+	@echo "SPI_DEV: $(SPI_DEV)"
 
 %.o: %.c $(HEADER_FILES)
 	@echo "CC $<"

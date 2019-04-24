@@ -3,9 +3,7 @@
 
 #include <stdint.h>
 
-#if 0
-#define SPI_DEV "/dev/spidev2.1"
-#else
+#ifndef SPI_DEV
 #define SPI_DEV "/dev/spidev1.0"
 #endif
 
