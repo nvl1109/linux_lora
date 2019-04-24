@@ -215,6 +215,7 @@ static void *s_lora_thread_func(void *arg)
                             }
                             clock_gettime(CLOCK_REALTIME, &ts);
                             s_slaves[msg.srcAddress].last_status_time_ms = (ts.tv_sec * 1000 + ts.tv_nsec / 10000000);
+                        break;
                         case RESP_ACKNOWLEDGE_PACKET:
                         case RESP_ACKNOWLEDGE_INTERIM_PACKET:
                             if(s_slaves[msg.srcAddress].order.requestID == msg.requestID){
