@@ -23,6 +23,7 @@
 
 #define TX_MESSGAGE_QUEUE_SIZE                             10
 #define MASTER_DEVICE_ID                                   0x80
+#define BROADCAST_SYNC_ID                                  0xF0
 #define SSLA_SIGNATURE                                     0x4224
 #define LORA_TX_BUFF_SIZE                                  250
 #define LORA_HEADER_SIZE                                   13
@@ -48,7 +49,8 @@ extern unsigned short             db_signature;
 
 typedef enum {
                /*this type of packetTyp is recieved by SLAVE*/
-               REQ_INTERIM_PACKET = 1,
+               REQ_SYNC_LAN_PACKET = 1,
+               REQ_INTERIM_PACKET = 2,
                REQ_READ_ANALOG_SENSOR,
                REQ_READ_DIGITAL_SENSOR,
                REQ_WRITE_GPIO_OUTPUT_PINS,

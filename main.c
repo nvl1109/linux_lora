@@ -12,8 +12,7 @@
 #include "supervisor.h"
 #include "os_abstraction.h"
 
-#define MAX_SLAVE 30
-//struct messageFormat txData;
+#define MAX_SLAVE 10
 
 typedef enum {
     SLAVE_OFFLINE = 0,
@@ -24,12 +23,13 @@ typedef enum {
 } slave_state_t;
 
 struct slave {
-    int addr;
+    //int addr;
     int64_t last_status_time_ms;
     int is_online;
     struct messageFormat order;
     int64_t last_order_time_ms;
     bool ack_recieved;
+    uint16_t last_requestID;
     slave_state_t state;
 };
 
@@ -46,11 +46,7 @@ union splitSignature {
 
 
 static struct slave s_slaves[MAX_SLAVE] = {
-    [0] = {.addr = 0,},
-    [1] = {.addr = 1,},
-    [2] = {.addr = 2,},
-    [3] = {.addr = 3,},
-    [4] = {.addr = 4,},
+    [0] = {.last_status_time_ms = 0,},
 };
 
 static pthread_mutex_t s_lora_tx_lock;
@@ -62,11 +58,13 @@ void check_slave_status();
 void sendNewOrder(uint8_t deviceID, PACKET_TYPE pktTyp);
 void resendOldOrder(struct messageFormat *txData, uint8_t deviceID);
 void clearOrder(uint8_t deviceID);
+void sendSyncPacket();
 
-static uint16_t last_requestID = 0;
+//static uint16_t last_requestID = 0;
 int  idx = 0;
 
 struct messageFormat txData;
+int64_t last_sync_sent_time_ms;
 
 int main(int argc, char **argv)
 {
@@ -79,7 +77,7 @@ int main(int argc, char **argv)
     s_thread_stop = 0;
     for(i = 0; i < MAX_SLAVE; ++i){
       memset(s_slaves, 0, sizeof(s_slaves));
-      s_slaves[i].addr = i;
+      //s_slaves[i].addr = i;
     }
     if (pthread_mutex_init(&s_lora_tx_lock, NULL) != 0)
     {
@@ -120,7 +118,7 @@ int main(int argc, char **argv)
             if ((ret < 0) || (ret >= MAX_SLAVE)) {
                 printf("ERR: slave id %d is invalid", ret);
             } else {
-                uint8_t addr = ret;
+                uint8_t address = ret;
                 PACKET_TYPE pktTyp;
                 slv = &s_slaves[ret];
                 // Check if the slave is online
@@ -141,7 +139,7 @@ int main(int argc, char **argv)
                     if ((ret < 0) || (ret > 6)) {
                         printf("ERR: invalid order message type %d", ret);
                     } else {
-                        sendNewOrder(addr, REQ_READ_ANALOG_SENSOR + ret);
+                        sendNewOrder(address, REQ_READ_ANALOG_SENSOR + ret);
                     }
                 }
             }
@@ -231,59 +229,63 @@ static void *s_lora_thread_func(void *arg)
                 count++;
             }
             print_dbg("Packet received: %d/%d bytes and request id 0x%x", count, sizeof(msg) , msg.requestID);
-            if(last_requestID != msg.requestID && !not_interested) {
-                last_requestID = msg.requestID;
-                print_dbg("RECV id %x, src %x, dst %x, sign %x, pkt id %x, type %d, len %d",
-                    msg.requestID, msg.srcAddress, msg.destAddress, msg.signature, msg.packetID, msg.packetTyp, msg.length);
-                if ((msg.packetTyp >= RESP_DEVICE_STARTED) && (msg.packetTyp <= RESP_INVALID_FRAME_NUMBER_ID)) {
-                    print_dbg("RESP packet received, slave #%d", msg.srcAddress);
-                    switch (msg.packetTyp) {
-                        case RESP_STATUS_PACKET:
-                            // Status packet --> update slave status
-                            if (!s_slaves[msg.srcAddress].is_online) {
-                                s_slaves[msg.srcAddress].is_online = 1;
-                                s_slaves[msg.srcAddress].state = SLAVE_ONLINE;
-                                print_inf("Slave #%d is ONLINE", msg.srcAddress);
-                            }
-                            clock_gettime(CLOCK_REALTIME, &ts);
-                            s_slaves[msg.srcAddress].last_status_time_ms = (ts.tv_sec * 1000 + ts.tv_nsec / 10000000);
+            if(!not_interested) {
+                if (s_slaves[msg.srcAddress].last_requestID != msg.requestID ) {
+                    s_slaves[msg.srcAddress].last_requestID = msg.requestID;
+                    print_dbg("RECV id %x, src %x, dst %x, sign %x, pkt id %x, type %d, len %d",
+                        msg.requestID, msg.srcAddress, msg.destAddress, msg.signature, msg.packetID, msg.packetTyp, msg.length);
+                    if ((msg.packetTyp >= RESP_DEVICE_STARTED) && (msg.packetTyp <= RESP_INVALID_FRAME_NUMBER_ID)) {
+                        print_dbg("RESP packet received, slave #%d", msg.srcAddress);
+                        switch (msg.packetTyp) {
+                            case RESP_STATUS_PACKET:
+                                // Status packet --> update slave status
+                                if (!s_slaves[msg.srcAddress].is_online) {
+                                    s_slaves[msg.srcAddress].is_online = 1;
+                                    s_slaves[msg.srcAddress].state = SLAVE_ONLINE;
+                                    print_inf("Slave #%d is ONLINE", msg.srcAddress);
+                                }
+                                clock_gettime(CLOCK_REALTIME, &ts);
+                                s_slaves[msg.srcAddress].last_status_time_ms = (ts.tv_sec * 1000 + ts.tv_nsec / 10000000);
+                                break;
+
+                            case RESP_ACKNOWLEDGE_PACKET:
+                            case RESP_ACKNOWLEDGE_INTERIM_PACKET:
+                                if(s_slaves[msg.srcAddress].order.requestID == msg.requestID){
+                                    s_slaves[msg.srcAddress].ack_recieved == true;
+                                    print_inf("ACK from slave #%d was received", msg.srcAddress);
+                                }
+                                clearOrder(msg.srcAddress);
                             break;
 
-                        case RESP_ACKNOWLEDGE_PACKET:
-                        case RESP_ACKNOWLEDGE_INTERIM_PACKET:
-                            if(s_slaves[msg.srcAddress].order.requestID == msg.requestID){
-                                s_slaves[msg.srcAddress].ack_recieved == true;
-                                print_inf("ACK from slave #%d was received", msg.srcAddress);
-                            }
-                            clearOrder(msg.srcAddress);
-                        break;
+                            case RESP_DEVICE_STARTED:
+                            case RESP_INVALID_PACKET:
+                            case RESP_INVALID_INTERIM_REQUEST_ID:
+                            case RESP_INVALID_FRAME_NUMBER_ID:
+                                // check_slave_status();
+                            break;
 
-                        case RESP_DEVICE_STARTED:
-                        case RESP_INVALID_PACKET:
-                        case RESP_INVALID_INTERIM_REQUEST_ID:
-                        case RESP_INVALID_FRAME_NUMBER_ID:
-                            // check_slave_status();
-                        break;
+                            case RESP_READ_ANALOG_SENSOR:
+                            case RESP_READ_DIGITAL_SENSOR:
+                            case RESP_WRITE_GPIO_OUTPUT_PINS:
+                            case RESP_READ_GPIO_INPUT_PINS:
+                            case RESP_READ_I2C_DATA:
+                            case RESP_READ_UART1_DATA:
+                            case RESP_READ_UART2_DATA:
+                            //NICK recieved response to order packet
+                              print_inf("RESP from slave #%d was received", msg.srcAddress);
+                            break;
 
-                        case RESP_READ_ANALOG_SENSOR:
-                        case RESP_READ_DIGITAL_SENSOR:
-                        case RESP_WRITE_GPIO_OUTPUT_PINS:
-                        case RESP_READ_GPIO_INPUT_PINS:
-                        case RESP_READ_I2C_DATA:
-                        case RESP_READ_UART1_DATA:
-                        case RESP_READ_UART2_DATA:
-                        //NICK recieved response to order packet
-                          print_inf("RESP from slave #%d was received", msg.srcAddress);
-                        break;
-
-                        default:
-                            printf("Invalid packetTyp.\n");
+                            default:
+                                printf("Invalid packetTyp.\n");
+                        }
+                    } else {
+                        print_err("Received invalid packet %d, from slave #%d", msg.packetTyp, msg.srcAddress);
                     }
-                } else {
-                    print_err("Received invalid packet %d, from slave #%d", msg.packetTyp, msg.srcAddress);
-                }
-           } else {
+              } else {
                 print_inf("message is same from 0x%x", msg.srcAddress);
+              }
+           } else {
+                print_inf("not interested ");
            }
         }
         pthread_mutex_unlock(&s_lora_tx_lock);
@@ -306,24 +308,61 @@ void check_slave_status()
   int64_t time_ms;
   int i;
   struct timespec ts;
-
+  bool isSlaveOnline;
   os_delay_ms(5);
   clock_gettime(CLOCK_REALTIME, &ts);
   time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
   for (i = 0; i < MAX_SLAVE; i++) {
-      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 10000)) {
-          // don't receive status message in 10s --> set offline
+      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_status_time_ms) >= 30000)) {
+          // don't receive status message in 30s --> set offline
           s_slaves[i].is_online = 0;
           s_slaves[i].state = SLAVE_OFFLINE;
           print_inf("Slave #%d is OFFLINE", i);
       }
-  }
-  //resend order since we did not recieve any ACK
-  for (i = 0; i < MAX_SLAVE; i++) {
-      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_order_time_ms) >= 3000) && s_slaves[i].order.requestID > 0 && s_slaves[i].ack_recieved == false) {
+      //resend order since we did not recieve any ACK
+      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_order_time_ms) >= 10000) && s_slaves[i].order.requestID > 0 && s_slaves[i].ack_recieved == false) {
          resendOldOrder(&s_slaves[i].order ,i);
       }
   }
+
+  isSlaveOnline = false;
+  if((time_ms - last_sync_sent_time_ms) >= 3500 ) {
+    for (i = 0; i < MAX_SLAVE; i++) {
+       if (s_slaves[i].is_online){
+         isSlaveOnline = true;
+         break;
+       }
+    }
+    if (!isSlaveOnline){
+      //Send Sync packet
+      sendSyncPacket();
+    }
+  }
+}
+
+void sendSyncPacket()
+{
+  struct messageFormat sync;
+  struct timespec ts;
+  uint16_t reqID = 0;
+
+  pthread_mutex_lock(&s_lora_tx_lock);
+  reqID = (rand() % 10000);
+  sync.srcAddress  = (uint8_t) MASTER_DEVICE_ID;
+  sync.destAddress = BROADCAST_SYNC_ID;
+  sync.signature   = SSLA_SIGNATURE;
+  sync.requestID   = reqID;
+  sync.packetID    = 0x0101;
+  sync.packetTyp   = REQ_SYNC_LAN_PACKET;
+  sync.length      = 0;
+  print_inf("BROADCAST SYNC to #%d, reqid %d, type %d", BROADCAST_SYNC_ID, sync.requestID, sync.packetTyp);
+
+  beginPacket(0);
+  loraWriteBuf((uint8_t *)&sync, LORA_HEADER_SIZE + sync.length);
+  endPacket(0);
+  pthread_mutex_unlock(&s_lora_tx_lock);
+  clock_gettime(CLOCK_REALTIME, &ts);
+  last_sync_sent_time_ms = (ts.tv_sec * 1000 + ts.tv_nsec / 10000000);
 }
 
 void sendNewOrder(uint8_t deviceID, PACKET_TYPE pktTyp)
