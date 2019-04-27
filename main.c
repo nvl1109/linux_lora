@@ -6,6 +6,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/time.h>
 
 #include "debug.h"
 #include "lora_rfm95.h"
@@ -44,7 +45,6 @@ union splitSignature {
    uint16_t signature;
 };
 
-
 static struct slave s_slaves[MAX_SLAVE] = {
     [0] = {.last_status_time_ms = 0,},
 };
@@ -59,6 +59,7 @@ void sendNewOrder(uint8_t deviceID, PACKET_TYPE pktTyp);
 void resendOldOrder(struct messageFormat *txData, uint8_t deviceID);
 void clearOrder(uint8_t deviceID);
 void sendSyncPacket();
+void process_master_send(void);
 
 //static uint16_t last_requestID = 0;
 int  idx = 0;
@@ -79,6 +80,7 @@ int main(int argc, char **argv)
       memset(s_slaves, 0, sizeof(s_slaves));
       //s_slaves[i].addr = i;
     }
+
     if (pthread_mutex_init(&s_lora_tx_lock, NULL) != 0)
     {
         print_err("mutex init has failed");
@@ -232,7 +234,7 @@ static void *s_lora_thread_func(void *arg)
             if(!not_interested) {
                 if (s_slaves[msg.srcAddress].last_requestID != msg.requestID ) {
                     s_slaves[msg.srcAddress].last_requestID = msg.requestID;
-                    print_dbg("RECV id %x, src %x, dst %x, sign %x, pkt id %x, type %d, len %d",
+                    print_inf("RECV id %x, src %x, dst %x, sign %x, pkt id %x, type %d, len %d",
                         msg.requestID, msg.srcAddress, msg.destAddress, msg.signature, msg.packetID, msg.packetTyp, msg.length);
                     if ((msg.packetTyp >= RESP_DEVICE_STARTED) && (msg.packetTyp <= RESP_INVALID_FRAME_NUMBER_ID)) {
                         print_dbg("RESP packet received, slave #%d", msg.srcAddress);
@@ -290,6 +292,7 @@ static void *s_lora_thread_func(void *arg)
         }
         pthread_mutex_unlock(&s_lora_tx_lock);
         check_slave_status();
+        process_master_send();
     }
 
 lb_lora_exit:
@@ -320,7 +323,7 @@ void check_slave_status()
           print_inf("Slave #%d is OFFLINE", i);
       }
       //resend order since we did not recieve any ACK
-      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_order_time_ms) >= 10000) && s_slaves[i].order.requestID > 0 && s_slaves[i].ack_recieved == false) {
+      if ((s_slaves[i].is_online) && ((time_ms - s_slaves[i].last_order_time_ms) >= 5100) && s_slaves[i].order.requestID > 0 && s_slaves[i].ack_recieved == false) {
          resendOldOrder(&s_slaves[i].order ,i);
       }
   }
@@ -371,27 +374,18 @@ void sendNewOrder(uint8_t deviceID, PACKET_TYPE pktTyp)
   struct timespec ts;
   struct messageFormat *order = &s_slaves[deviceID].order;
 
-  if (!s_slaves[deviceID].is_online) {
+  if ((!s_slaves[deviceID].is_online) || (s_slaves[deviceID].state == SLAVE_BUSY)) {
+    print_err("Slave #%d isn't online or is busy", deviceID);
     return;
   }
-  pthread_mutex_lock(&s_lora_tx_lock);
-  reqID = (rand() % 10000);
+  s_slaves[deviceID].state = SLAVE_BUSY;
   order->srcAddress  = (uint8_t) MASTER_DEVICE_ID;
   order->destAddress = deviceID;
   order->signature   = SSLA_SIGNATURE;
-  order->requestID   = reqID;
+  order->requestID   = (rand() % 10000);
   order->packetID    = 0x0101;
   order->packetTyp   = pktTyp;
   order->length      = 0;
-  print_inf("ORDER to #%d, reqid %d, type %d", deviceID, order->requestID, order->packetTyp);
-
-  beginPacket(0);
-  loraWriteBuf((uint8_t *)order, LORA_HEADER_SIZE + order->length);
-  endPacket(0);
-  os_delay_ms(2);
-  clock_gettime(CLOCK_REALTIME, &ts);
-  s_slaves[deviceID].last_order_time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
-  pthread_mutex_unlock(&s_lora_tx_lock);
 }
 
 void resendOldOrder(struct messageFormat *txData, uint8_t deviceID)
@@ -399,17 +393,55 @@ void resendOldOrder(struct messageFormat *txData, uint8_t deviceID)
   if (!s_slaves[deviceID].is_online) {
     return;
   }
-  struct timespec ts;
-  pthread_mutex_lock(&s_lora_tx_lock);
-  beginPacket(0);
-  loraWriteBuf((uint8_t *)txData, LORA_HEADER_SIZE + txData->length);
-  endPacket(0);
-  os_delay_ms(2);
-  clock_gettime(CLOCK_REALTIME, &ts);
-  s_slaves[deviceID].last_order_time_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
-  pthread_mutex_unlock(&s_lora_tx_lock);
+  s_slaves[deviceID].state = SLAVE_BUSY;
 }
 
 void clearOrder(uint8_t deviceID) {
     memset(&s_slaves[deviceID].order, 0, sizeof(struct messageFormat));
+    s_slaves[deviceID].state = SLAVE_ONLINE;
+}
+
+void process_master_send(void)
+{
+    int i;
+    struct timespec ts;
+    struct messageFormat *order = NULL;
+    struct slave *slv = NULL;
+    int64_t time_ms, curtime_ms;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    curtime_ms = ts.tv_sec * 1000 + ts.tv_nsec / 10000000;
+    time_ms = curtime_ms - last_sync_sent_time_ms;
+    time_ms = time_ms % 5000; // precision of 5s
+
+    if (time_ms < 4500) {
+        // Not master slot
+        return;
+    }
+
+    // Browse all slaves
+    for (i = 0; i < MAX_SLAVE; ++i) {
+        slv = &s_slaves[i];
+
+        if ((!slv->is_online) || (slv->state != SLAVE_BUSY)) {
+            // This slave isn't online or doesn't have message to transmit
+            continue;
+        }
+
+        // Transmit order
+        pthread_mutex_lock(&s_lora_tx_lock);
+        order = &slv->order;
+        print_inf("ORDER to #%d, reqid %d, type %d", order->destAddress, order->requestID, order->packetTyp);
+
+        beginPacket(0);
+        loraWriteBuf((uint8_t *)order, LORA_HEADER_SIZE + order->length);
+        endPacket(0);
+        os_delay_ms(1);
+        pthread_mutex_unlock(&s_lora_tx_lock);
+        slv->last_order_time_ms = curtime_ms;
+
+        // Set state to IDLE
+        slv->state = SLAVE_ONLINE;
+    }
+
 }

@@ -5,7 +5,7 @@ HEADER_FILES := $(shell find . -name '*.h')
 SPI_DEV ?= /dev/spidev1.0
 
 CFLAGS += -Wall -D__DEBUG=0 -DSPI_DEV=\"$(SPI_DEV)\"
-LDFLAGS += -lpthread
+LDFLAGS += -lpthread -lrt
 
 all: $(APP_NAME)
 
