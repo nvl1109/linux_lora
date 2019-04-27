@@ -82,7 +82,7 @@ struct __attribute((__packed__)) messageFormat {
     uint16_t    signature;                             // signature byte to identify the packet is from SSLA
     uint16_t    requestID;                             // request id represents the requests from master to slave
     uint16_t    packetID;                              // byte1 is total frames byte2 frame no
-    PACKET_TYPE packetTyp;                             // TAG specifies the operations to do
+    uint8_t     packetTyp;                             // TAG specifies the operations to do
     uint8_t     length;                                // Just length of the payload
     uint8_t     payload[LORA_TX_BUFF_SIZE - 10];       // payload
 };
